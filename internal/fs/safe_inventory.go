@@ -11,6 +11,8 @@ import (
 	"runtime"
 	"sort"
 	"strings"
+	"sync"
+	"sync/atomic"
 
 	"github.com/aoci-spec/aoci-code/internal/machinecontract"
 )
@@ -94,24 +96,36 @@ func BuildSafeInventory(root string, opt WalkOptions) (*SafeInventory, error) {
 		return nil, err
 	}
 	var pruned []SafeInventoryExclusion
+	gitAuthority := gitRepository
 	if !gitRepository {
-		tracked = nil
-		untracked, pruned, err = traversePathNames(absRoot)
-		if err != nil {
-			return nil, err
+		// A root that is not itself a repository can still be a workspace:
+		// several repositories side by side under a directory Git does not
+		// govern. Each nested repository keeps its own tracked/ignored
+		// authority, and only the paths outside every repository fall back to
+		// secure traversal.
+		workspace, workspaceErr := workspaceInventory(absRoot)
+		if workspaceErr != nil {
+			return nil, workspaceErr
 		}
-		ignored = nil
+		if workspace.Repositories > 0 {
+			tracked, untracked, ignored = workspace.Tracked, workspace.Untracked, workspace.Ignored
+			pruned = workspace.Pruned
+			gitAuthority = true
+		} else {
+			tracked = nil
+			untracked, pruned, err = traversePathNames(absRoot)
+			if err != nil {
+				return nil, err
+			}
+			ignored = nil
+		}
 	}
 
 	report := &SafeInventory{Summary: SafeInventorySummary{
 		Version: SafeInventoryVersion, GitRepository: gitRepository,
 		GitTracked: len(tracked), NonignoredUntracked: len(untracked), Ignored: len(ignored),
 	}, ManagedCandidates: []string{}, TrackedPaths: []string{}, IgnoredPaths: []string{}, Exclusions: []SafeInventoryExclusion{}}
-	if !gitRepository {
-		for _, exclusion := range pruned {
-			report.addExclusion(exclusion.PathSummary, exclusion.Category, exclusion.RuleSource, false)
-		}
-	} else {
+	if gitAuthority {
 		// Git ignored names are classified before any content read. Consumers
 		// that request policy evaluation may retain otherwise-safe names as
 		// candidates; ordinary Safe Inventory continues to exclude them.
@@ -129,6 +143,9 @@ func BuildSafeInventory(root string, opt WalkOptions) (*SafeInventory, error) {
 				report.addExclusion(rel, SafetyIgnored, "gitignore", false)
 			}
 		}
+	}
+	for _, exclusion := range pruned {
+		report.addExclusion(exclusion.PathSummary, exclusion.Category, exclusion.RuleSource, false)
 	}
 	trackedSet := make(map[string]bool, len(tracked))
 	for _, path := range tracked {
@@ -226,45 +243,282 @@ func (summary *SafeInventorySummary) addReviewVisible(count int) {
 }
 
 func gitInventory(root string) (tracked, untracked, ignored []string, gitRepository bool, err error) {
+	gitRepository, err = gitRepositoryBoundary(root)
+	if err != nil || !gitRepository {
+		return nil, nil, nil, gitRepository, err
+	}
+	tracked, err = gitListPaths(root, "ls-files", "-z", "--cached")
+	if err != nil {
+		return nil, nil, nil, true, err
+	}
+	untracked, err = gitListPaths(root, "ls-files", "-z", "--others", "--exclude-standard")
+	if err != nil {
+		return nil, nil, nil, true, err
+	}
+	ignored, err = gitListPaths(root, "ls-files", "-z", "--others", "--ignored", "--exclude-standard")
+	return tracked, untracked, ignored, true, err
+}
+
+// gitRepositoryBoundary reports whether root carries Git's own boundary entry
+// and whether Git confirms root as the top level of that repository.
+//
+// An unverifiable or foreign boundary returns an error rather than false: once
+// a .git boundary is present, silently downgrading to non-Git traversal could
+// hide tracked sensitive files from the required-review signal.
+func gitRepositoryBoundary(root string) (bool, error) {
 	if _, statErr := os.Lstat(filepath.Join(root, ".git")); statErr != nil {
 		if errors.Is(statErr, os.ErrNotExist) {
-			return nil, nil, nil, false, nil
+			return false, nil
 		}
-		return nil, nil, nil, false, fmt.Errorf("safe_inventory_git_boundary_unavailable")
+		return false, fmt.Errorf("safe_inventory_git_boundary_unavailable")
 	}
 	probe := UntrustedRepositoryGitCommand(root, "rev-parse", "--show-toplevel")
 	probeOutput, probeErr := probe.Output()
 	var executableError *exec.Error
 	if errors.As(probeErr, &executableError) {
-		return nil, nil, nil, true, fmt.Errorf("safe_inventory_git_unavailable")
+		return true, fmt.Errorf("safe_inventory_git_unavailable")
 	}
 	if probeErr != nil {
-		return nil, nil, nil, true, fmt.Errorf("safe_inventory_git_query_failed")
+		return true, fmt.Errorf("safe_inventory_git_query_failed")
 	}
 	if !sameGitRootPath(strings.TrimSpace(string(probeOutput)), root, runtime.GOOS) {
 		// Once a .git boundary is present, an unverifiable or foreign repository
 		// root must not silently downgrade to non-Git traversal. Doing so could
 		// hide tracked sensitive files from the required-review signal.
-		return nil, nil, nil, true, fmt.Errorf("safe_inventory_git_boundary_mismatch")
+		return true, fmt.Errorf("safe_inventory_git_boundary_mismatch")
 	}
-	run := func(args ...string) ([]string, error) {
-		command := UntrustedRepositoryGitCommand(root, append([]string{"-c", "core.quotepath=false"}, args...)...)
-		data, commandErr := command.Output()
-		if commandErr != nil {
-			return nil, fmt.Errorf("safe_inventory_git_query_failed")
+	return true, nil
+}
+
+// gitListPaths runs one Git listing query and returns its sorted
+// repository-relative paths.
+func gitListPaths(root string, args ...string) ([]string, error) {
+	command := UntrustedRepositoryGitCommand(root, append([]string{"-c", "core.quotepath=false"}, args...)...)
+	data, commandErr := command.Output()
+	if commandErr != nil {
+		return nil, fmt.Errorf("safe_inventory_git_query_failed")
+	}
+	return splitNULPaths(data), nil
+}
+
+// workspaceFacts is the Git-derived view of a non-Git root that holds nested
+// repositories.
+type workspaceFacts struct {
+	Repositories int
+	Tracked      []string
+	Untracked    []string
+	Ignored      []string
+	Pruned       []SafeInventoryExclusion
+}
+
+// workspaceInventory collects, for every Git repository nested under a non-Git
+// root, the same tracked/untracked/ignored facts a single-repository root
+// produces, with every path rewritten relative to the workspace root. Paths
+// that belong to no repository stay on the secure traversal route.
+//
+// Why this exists: a workspace root has no Git authority of its own, so it
+// degrades to raw traversal and a file that repoA/.gitignore hides looks
+// exactly like the file beside it that repoA tracks; the ignored bytes then
+// enter Baseline, Evidence, and Candidate. The decision must stay per
+// repository, because both names can sit in the same directory.
+//
+// Cost: one traversal that stops at each repository boundary, plus one Git
+// question per repository. Those questions run concurrently and bounded by
+// GOMAXPROCS, so a workspace of N repositories pays about one repository's Git
+// latency instead of N times it. A workspace with no nested repository reports
+// zero repositories and the caller keeps the plain traversal, so this adds
+// nothing to the ordinary non-Git case.
+func workspaceInventory(root string) (workspaceFacts, error) {
+	facts := workspaceFacts{
+		Tracked: []string{}, Untracked: []string{}, Ignored: []string{}, Pruned: []SafeInventoryExclusion{},
+	}
+	repositories, loose, pruned, err := discoverNestedRepositories(root)
+	if err != nil {
+		return facts, err
+	}
+	facts.Pruned = pruned
+	facts.Untracked = append(facts.Untracked, loose...)
+	facts.Repositories = len(repositories)
+	if len(repositories) == 0 {
+		return facts, nil
+	}
+
+	// Four Git questions per repository, all independent of each other, so they
+	// share one bounded pool: a workspace of N repositories waits for about one
+	// pool's worth of subprocess latency instead of N sequential question
+	// rounds. The questions stay the same ones a single-repository root asks,
+	// in the same order, and each answer keeps its own slot.
+	const (
+		queryBoundary = iota
+		queryTracked
+		queryUntracked
+		queryIgnored
+		queriesPerRepository
+	)
+	type nestedFacts struct {
+		boundaryConfirmed bool
+		boundaryErr       error
+		tracked           []string
+		untracked         []string
+		ignored           []string
+		listErrs          [queriesPerRepository - 1]error
+	}
+	queryTotal := len(repositories) * queriesPerRepository
+	outcomes := make([]nestedFacts, len(repositories))
+	workers := runtime.GOMAXPROCS(0)
+	if workers > queryTotal {
+		workers = queryTotal
+	}
+	if workers < 1 {
+		workers = 1
+	}
+	var nextQuery int64
+	var waitGroup sync.WaitGroup
+	waitGroup.Add(workers)
+	for worker := 0; worker < workers; worker++ {
+		go func() {
+			defer waitGroup.Done()
+
+			for {
+				queryIndex := int(atomic.AddInt64(&nextQuery, 1)) - 1
+				if queryIndex >= queryTotal {
+					return
+				}
+				repositoryIndex := queryIndex / queriesPerRepository
+				repository := repositories[repositoryIndex]
+				switch queryIndex % queriesPerRepository {
+				case queryBoundary:
+					confirmed, boundaryErr := gitRepositoryBoundary(repository)
+					outcomes[repositoryIndex].boundaryConfirmed = confirmed
+					outcomes[repositoryIndex].boundaryErr = boundaryErr
+				case queryTracked:
+					outcomes[repositoryIndex].tracked, outcomes[repositoryIndex].listErrs[0] =
+						gitListPaths(repository, "ls-files", "-z", "--cached")
+				case queryUntracked:
+					outcomes[repositoryIndex].untracked, outcomes[repositoryIndex].listErrs[1] =
+						gitListPaths(repository, "ls-files", "-z", "--others", "--exclude-standard")
+				case queryIgnored:
+					outcomes[repositoryIndex].ignored, outcomes[repositoryIndex].listErrs[2] =
+						gitListPaths(repository, "ls-files", "-z", "--others", "--ignored", "--exclude-standard")
+				}
+			}
+		}()
+	}
+	waitGroup.Wait()
+
+	for index, repository := range repositories {
+		outcome := outcomes[index]
+		if outcome.boundaryErr != nil {
+			return facts, outcome.boundaryErr
 		}
-		return splitNULPaths(data), nil
+		if !outcome.boundaryConfirmed {
+			// The boundary entry was seen but Git does not confirm a repository
+			// there. Failing closed matches the single-root rule: a .git
+			// boundary never silently degrades to raw traversal, which would
+			// hide ignored content.
+			return facts, fmt.Errorf("safe_inventory_git_boundary_unavailable")
+		}
+		for _, listErr := range outcome.listErrs {
+			if listErr != nil {
+				return facts, listErr
+			}
+		}
+		prefix, prefixErr := filepath.Rel(root, repository)
+		if prefixErr != nil {
+			return facts, fmt.Errorf("safe_inventory_git_boundary_unavailable")
+		}
+		prefix = filepath.ToSlash(prefix)
+		facts.Tracked = append(facts.Tracked, prefixRepositoryPaths(prefix, outcome.tracked)...)
+		facts.Untracked = append(facts.Untracked, prefixRepositoryPaths(prefix, outcome.untracked)...)
+		facts.Ignored = append(facts.Ignored, prefixRepositoryPaths(prefix, outcome.ignored)...)
 	}
-	tracked, err = run("ls-files", "-z", "--cached")
+	sort.Strings(facts.Tracked)
+	sort.Strings(facts.Untracked)
+	sort.Strings(facts.Ignored)
+	return facts, nil
+}
+
+func prefixRepositoryPaths(prefix string, paths []string) []string {
+	if prefix == "" || prefix == "." {
+		return append([]string{}, paths...)
+	}
+	prefixed := make([]string, 0, len(paths))
+	for _, path := range paths {
+		prefixed = append(prefixed, prefix+"/"+path)
+	}
+	return prefixed
+}
+
+// discoverNestedRepositories walks a non-Git root once and returns the
+// directories that hold a .git entry, plus the files that live outside every
+// repository.
+//
+// A repository boundary ends the descent: those paths are answered by that
+// repository's own Git queries, and walking them here would both duplicate the
+// work and lose the ignore authority that makes the walk safe. Built-in safety
+// categories prune exactly as they do on the plain traversal route, so a
+// workspace cannot pull into scope what a single-repository root would refuse.
+func discoverNestedRepositories(root string) ([]string, []string, []SafeInventoryExclusion, error) {
+	repositories := []string{}
+	loose := []string{}
+	pruned := []SafeInventoryExclusion{}
+	err := filepath.WalkDir(root, func(path string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			if entry != nil && entry.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if path == root {
+			return nil
+		}
+		rel, relErr := filepath.Rel(root, path)
+		if relErr != nil {
+			return nil
+		}
+		rel = filepath.ToSlash(rel)
+		category, _ := BuiltInSafetyCategory(rel)
+		if unsafePlatformObject(path) {
+			pruned = append(pruned, SafeInventoryExclusion{PathSummary: rel, Category: SafetyUnsafe, RuleSource: "filesystem_boundary"})
+			if entry.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if entry.IsDir() {
+			if category != "" {
+				_, source := BuiltInSafetyCategory(rel)
+				pruned = append(pruned, SafeInventoryExclusion{PathSummary: rel, Category: category, RuleSource: source})
+				return filepath.SkipDir
+			}
+			if entry.Type()&os.ModeSymlink != 0 {
+				pruned = append(pruned, SafeInventoryExclusion{PathSummary: rel, Category: SafetyUnsafe, RuleSource: "filesystem_boundary"})
+				return filepath.SkipDir
+			}
+			if hasGitBoundary(path) {
+				repositories = append(repositories, path)
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		loose = append(loose, rel)
+		return nil
+	})
+	sort.Strings(repositories)
+	sort.Strings(loose)
+	sort.Slice(pruned, func(i, j int) bool { return pruned[i].PathSummary < pruned[j].PathSummary })
+	return repositories, loose, pruned, err
+}
+
+// hasGitBoundary reports whether a directory holds Git's own boundary entry.
+// Both forms count: an ordinary repository keeps .git as a directory, while a
+// submodule or linked worktree keeps it as a file pointing at the real gitdir.
+func hasGitBoundary(directory string) bool {
+	info, err := os.Lstat(filepath.Join(directory, ".git"))
 	if err != nil {
-		return nil, nil, nil, true, err
+		return false
 	}
-	untracked, err = run("ls-files", "-z", "--others", "--exclude-standard")
-	if err != nil {
-		return nil, nil, nil, true, err
-	}
-	ignored, err = run("ls-files", "-z", "--others", "--ignored", "--exclude-standard")
-	return tracked, untracked, ignored, true, err
+	return info.IsDir() || info.Mode().IsRegular()
 }
 
 func sameGitRootPath(gitRoot, inventoryRoot, goos string) bool {

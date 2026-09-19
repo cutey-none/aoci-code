@@ -8,7 +8,11 @@ Ledger, and Recovery.
 Safe Inventory v2 is the default source-discovery boundary used by Scan,
 planning, Business Source Manifest, and onboarding. It keeps Git-ignored
 secrets and generated runtime state out before content reads or hashes, while
-still discovering non-ignored new source and non-Git projects.
+still discovering non-ignored new source and non-Git projects. A directory that
+is not itself a repository but holds repositories (a workspace) is inventoried
+through each nested repository's own Git authority, with paths prefixed by that
+repository's directory; only paths outside every nested repository use plain
+traversal.
 
 Managed Scope can retain otherwise-safe ignored path names for rule evaluation
 without weakening hard exclusions. Only a winning `index` or `observe` role
