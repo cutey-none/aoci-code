@@ -2,6 +2,32 @@
 
 All notable public changes to AOCI-CODE will be documented in this file.
 
+## Unreleased
+
+Two contributor changes, both invisible to existing indexes: repository
+snapshots hash their files concurrently with byte-identical output, and a root
+that is not itself a Git repository now indexes each nested repository through
+that repository's own Git authority. No index format, JSON field, CLI or MCP
+schema, or Baseline identity changes, and a single-repository root or a plain
+directory takes exactly the code paths it took before.
+
+- Hash repository snapshots in parallel. A snapshot hashed every managed
+  candidate on one goroutine, so about half of that pass sat in serial
+  `open`/`read`/`close` syscalls. Candidates now go to `GOMAXPROCS` workers and
+  their results come back in path order, which keeps the fingerprint map, the
+  per-file warning text and order, and every failure path identical to the
+  serial pass. Measured on a 1,302-file checkout: 487 ms to 221 ms, and `aoci
+  scan` in a copy of this repository (1,208 files) reports 757 ms to 336 ms.
+- Index workspaces whose repositories are nested. A directory that is not a Git
+  repository fell back to name-only traversal, so a file hidden by
+  `repoA/.gitignore` was inventoried exactly like the file beside it that
+  `repoA` tracks, and Git-ignored build output entered the Baseline. Such a
+  root now takes each nested repository's tracked, non-ignored untracked, and
+  ignored paths, prefixed by that repository's directory, and only paths
+  outside every repository keep the older traversal; a nested `.git` boundary
+  Git cannot confirm fails closed. Measured on a six-repository workspace of
+  3,372 files: 1,513 ms and 3,372 files to 195 ms and 372 files.
+
 ## v0.1.0-rc14
 
 One format-level fix: directory and file names the index grammar could not
