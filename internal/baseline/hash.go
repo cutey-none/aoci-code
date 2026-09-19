@@ -21,6 +21,9 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
+	"sync"
+	"sync/atomic"
 )
 
 const (
@@ -36,9 +39,99 @@ const (
 	fingerprintReadBufferBytes = 32 * 1024
 )
 
+// fingerprintBufferPool recycles the per-file read buffer. A full snapshot
+// opens one reader per file, so allocating 32 KiB for every file turns a
+// repository scan into tens of megabytes of short-lived garbage; the buffers
+// carry no per-file state and are always released at the exact size they were
+// acquired at.
+var fingerprintBufferPool = sync.Pool{
+	New: func() any {
+		return make([]byte, fingerprintReadBufferBytes)
+	},
+}
+
+func acquireFingerprintBuffer() []byte {
+	return fingerprintBufferPool.Get().([]byte)
+}
+
+func releaseFingerprintBuffer(buffer []byte) {
+	if cap(buffer) != fingerprintReadBufferBytes {
+		// Never return a wrong-sized slice to the pool: a caller that grew or
+		// re-sliced the buffer must not change what the next caller acquires.
+		return
+	}
+	fingerprintBufferPool.Put(buffer[:fingerprintReadBufferBytes])
+}
+
 // HashFile流式计算文件原始SHA-256、实际字节数和可选规范化指纹。
 func HashFile(path string) (Fingerprint, error) {
 	return hashFile(path, nil)
+}
+
+// HashOutcome carries one path's fingerprint, or the read failure that took its
+// place. It exists so callers can hash a set of paths concurrently and still
+// assemble their own output in the caller's original order.
+type HashOutcome struct {
+	Fingerprint Fingerprint
+	Err         error
+}
+
+// HashPathsParallel hashes repository-relative paths with bounded concurrency.
+//
+// It returns exactly what a serial loop of HashFileReusing(root/rel, prior[rel])
+// returns, in the same order, including which paths fail: every input has its
+// own slot, so a failure never shifts or hides a neighbour's outcome. Callers
+// keep their own error and warning ordering rules on top of this slice.
+//
+// Bounded by GOMAXPROCS and by the number of paths, so the number of
+// simultaneously open file descriptors stays bounded.
+func HashPathsParallel(root string, relPaths []string, prior map[string]Fingerprint) []HashOutcome {
+	outcomes := make([]HashOutcome, len(relPaths))
+	if len(relPaths) == 0 {
+		return outcomes
+	}
+
+	workers := runtime.GOMAXPROCS(0)
+	if workers > len(relPaths) {
+		workers = len(relPaths)
+	}
+	if workers < 1 {
+		workers = 1
+	}
+
+	var nextIndex int64
+	var waitGroup sync.WaitGroup
+	waitGroup.Add(workers)
+
+	for worker := 0; worker < workers; worker++ {
+		go func() {
+			defer waitGroup.Done()
+
+			for {
+				index := int(atomic.AddInt64(&nextIndex, 1)) - 1
+				if index >= len(relPaths) {
+					return
+				}
+
+				relPath := relPaths[index]
+				fingerprint, err := HashFileReusing(
+					filepath.Join(
+						root,
+						filepath.FromSlash(relPath),
+					),
+					prior[relPath],
+				)
+				outcomes[index] = HashOutcome{
+					Fingerprint: fingerprint,
+					Err:         err,
+				}
+			}
+		}()
+	}
+
+	waitGroup.Wait()
+
+	return outcomes
 }
 
 // HashFileReusing returns exactly what HashFile returns, but when the raw digest
@@ -88,10 +181,8 @@ func hashFile(path string, reuse *Fingerprint) (Fingerprint, error) {
 	rawHash := sha256.New()
 	normalizedHash := sha256.New()
 
-	buffer := make(
-		[]byte,
-		fingerprintReadBufferBytes,
-	)
+	buffer := acquireFingerprintBuffer()
+	defer releaseFingerprintBuffer(buffer)
 
 	var totalBytes int64
 	var sniffedBytes int64
@@ -258,6 +349,15 @@ func foldCRLFInto(
 ) bool {
 	if len(chunk) == 0 {
 		return pendingCR
+	}
+
+	// Fast path: a chunk with no pending CR and no CR at all folds to itself.
+	// Writing it directly keeps the common case (LF or CRLF-free text, and every
+	// binary chunk) free of the scratch allocation and copy below, without
+	// changing what is hashed.
+	if !pendingCR && bytes.IndexByte(chunk, '\r') < 0 {
+		_, _ = dst.Write(chunk)
+		return false
 	}
 
 	start := 0
