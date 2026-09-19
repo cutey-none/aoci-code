@@ -22,6 +22,19 @@ An AOCI upgrade is a binary replacement, not an index rewrite.
 9. Run `verify`, `check`, and the current Guide on representative Volumes
    repositories. Run `status --deep` only on a Legacy repository.
 
+## Workspace roots now read their nested repositories' Git authority
+
+A root that is not itself a Git repository and holds repositories is now
+inventoried through each nested repository's own tracked, non-ignored
+untracked, and ignored paths, as
+[`spec/public/aoci-safe-inventory-and-scope-refresh-v1.txt`](../spec/public/aoci-safe-inventory-and-scope-refresh-v1.txt)
+states. An existing Baseline keeps its fingerprints, but the paths those nested
+repositories ignore are no longer candidates: the next `scan` records the
+smaller selection, no Scope Change is demanded, and an Entry written for an
+ignored path surfaces through the ordinary orphan decision instead of blocking
+the repository. A repository root, and a directory with no nested repository,
+are unaffected.
+
 ## Managed Scope path semantics became host-independent
 
 Path matching now uses Git semantics -- exact and case-sensitive -- on every host. Earlier versions probed the filesystem and folded the result into the applied scope identity, so the same repository could carry different governance identities on Linux and Windows.

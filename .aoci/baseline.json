@@ -1,7 +1,7 @@
 {
   "version": 1,
   "created_at": "2026-08-07T17:44:36Z",
-  "updated_at": "2026-09-19T16:50:48Z",
+  "updated_at": "2026-09-19T16:55:35Z",
   "files": {
     ".gitattributes": {
       "role": "index",
@@ -123,9 +123,9 @@
       "normalized_sha256": "ad74b5eaed30b4703b40eeea04598a2bc3a2bb15beb2425b74144d2d196fc39a"
     },
     "aoci.code.txt": {
-      "sha256": "3d51fdd33f740582b590048e976952faa74d4b9958c04c58a1563f655e2209ed",
-      "size": 188485,
-      "normalized_sha256": "3d51fdd33f740582b590048e976952faa74d4b9958c04c58a1563f655e2209ed"
+      "sha256": "61c6fd0c57c460a3872d5262619ca3809ee6aae07cc41e6cd3a8d3ff46c5bcc7",
+      "size": 188505,
+      "normalized_sha256": "61c6fd0c57c460a3872d5262619ca3809ee6aae07cc41e6cd3a8d3ff46c5bcc7"
     },
     "aoci.meta.txt": {
       "role": "index",
@@ -244,9 +244,9 @@
       "normalized_sha256": "16a03fde9dcc18e069bce9960f712b93ce756cb8d7e9e693db3dfab9475d2336"
     },
     "docs/upgrading.md": {
-      "sha256": "b68a0574ffb41542da24689f27b59150b010ac340ddcec099b217945dae9a984",
-      "size": 5662,
-      "normalized_sha256": "b68a0574ffb41542da24689f27b59150b010ac340ddcec099b217945dae9a984"
+      "sha256": "5ce03603c8dacabe394a09ddc4fbd48da72adbe75835c507488cd7bd1430ebde",
+      "size": 6434,
+      "normalized_sha256": "5ce03603c8dacabe394a09ddc4fbd48da72adbe75835c507488cd7bd1430ebde"
     },
     "docs/windows-host-agent.en.md": {
       "role": "index",
