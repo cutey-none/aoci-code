@@ -44,14 +44,19 @@ const (
 // repository scan into tens of megabytes of short-lived garbage; the buffers
 // carry no per-file state and are always released at the exact size they were
 // acquired at.
+//
+// The pool holds a pointer to the slice on purpose: a []byte stored directly in
+// an any would be boxed on every Put, which is the allocation this pool exists
+// to avoid (staticcheck SA6002).
 var fingerprintBufferPool = sync.Pool{
 	New: func() any {
-		return make([]byte, fingerprintReadBufferBytes)
+		buffer := make([]byte, fingerprintReadBufferBytes)
+		return &buffer
 	},
 }
 
 func acquireFingerprintBuffer() []byte {
-	return fingerprintBufferPool.Get().([]byte)
+	return *fingerprintBufferPool.Get().(*[]byte)
 }
 
 func releaseFingerprintBuffer(buffer []byte) {
@@ -60,7 +65,8 @@ func releaseFingerprintBuffer(buffer []byte) {
 		// re-sliced the buffer must not change what the next caller acquires.
 		return
 	}
-	fingerprintBufferPool.Put(buffer[:fingerprintReadBufferBytes])
+	exact := buffer[:fingerprintReadBufferBytes]
+	fingerprintBufferPool.Put(&exact)
 }
 
 // HashFile流式计算文件原始SHA-256、实际字节数和可选规范化指纹。
